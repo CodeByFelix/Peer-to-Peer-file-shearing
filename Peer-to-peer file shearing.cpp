@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <string>
+#include <sstream>
 #include <fstream>
 #include <WinSock2.h>
 
@@ -15,8 +16,8 @@ private:
 	WSADATA wsaData;
 	SOCKET server, client;
 	sockaddr_in serverAddr, clientAddr;
-	static const int bufferSize = 1024;
-	char buffer[bufferSize];
+	static const int bufferSize = 102400;
+	
 
 public:
 	explicit SocketServer(const int& _portNumber) : portNumber(_portNumber) {}
@@ -73,29 +74,53 @@ public:
 	//Open Files
 	void sendFile(const std::string& fileName)
 	{
+		std::string buffer(bufferSize, '\0');
 		std::ifstream file(fileName, std::ios::binary);
 		if (!file)
 			throw std::runtime_error("File Fail to open\n");
-
-		if (send(client, fileName.c_str(), fileName.length() +1, 0) == SOCKET_ERROR)
+        
+        file.seekg(0, std::ios::end);
+        std::streampos fileSize = file.tellg();
+        file.seekg(0, std::ios::beg);
+        std::cout << "File Size is " << fileSize << "bytes.\n"; 
+        std::ostringstream oss;
+        oss << fileName << "-" << fileSize;
+        std::string header = oss.str();
+		if (send(client, header.c_str(), header.length() +1, 0) == SOCKET_ERROR)
 			throw std::runtime_error("Error sending file Name.\n");
 
+        unsigned long byteSent = 0;
+        int percent;
 		while (!file.eof())
 		{
-			file.read(buffer, bufferSize);
+			file.read(&buffer[0], bufferSize);
 			int bytesRead = file.gcount();
-			std::cout << "Sending " << bytesRead << "Bytes." << std::endl;
-			if (send(client, buffer, bytesRead, 0) == SOCKET_ERROR)
+            byteSent += bytesRead;
+            percent = (static_cast<float> (byteSent)/fileSize) * 100;
+			std::cout << "Sending " << percent << "%" << std::endl;
+			if (send(client, buffer.c_str(), bytesRead, 0) == SOCKET_ERROR)
 				throw std::runtime_error("Error Sending File.\n");
+            int bytesReceived = recv(client, &buffer[0], bufferSize, 0);
+            if(!(bytesReceived > 0))
+                throw std::runtime_error("Receiving Acknoledgement failed.\n client disconnected");
 		}
+		
+        buffer = "file has endded";
+		if (send(client, buffer.c_str(), 15, 0) == SOCKET_ERROR)
+			throw std::runtime_error("Error Sending File.\n");
+        int bytesReceived = recv(client, &buffer[0], bufferSize, 0);
+        if(!(bytesReceived > 0))
+            throw std::runtime_error("Receiving Acknoledgement failed.\n client disconnected");
+
 		std::cout << "File sent Successfully.\n";
 	}
 
 	//Receive from client
-	[[nodiscard]] const auto& receive()
+	[[nodiscard]] const std::string receive()
 	{
-		ZeroMemory(buffer, bufferSize);
-		int bytesRead = recv(client, buffer, bufferSize, 0);
+		std::string buffer(bufferSize, '\0');
+		
+		int bytesRead = recv(client, &buffer[0], bufferSize, 0);
 		if (bytesRead > 0)
 		{
 			std::cout << "Message received is: " << buffer << std::endl;
@@ -112,13 +137,12 @@ class SocketClient
 {
 private:
 	int portNumber;
-	//char ipAddress [20];
 	std::string ipAddress;
 	WSADATA wsaData;
 	SOCKET client;
 	sockaddr_in serverAddr;
-	static const int bufferSize = 1024;
-	char buffer[bufferSize];
+	static const int bufferSize = 102400;
+	
 
 public:
 	explicit SocketClient(const int& _portNumber, const std::string& _ipAddress) :
@@ -162,29 +186,42 @@ public:
 
 	void receiveFile()
 	{
+		std::string buffer(bufferSize, '\0');
 		int bytesReceived;
 		std::string fileName;
-		bytesReceived = recv(client, buffer, bufferSize, 0);
+		bytesReceived = recv(client, &buffer[0], bufferSize, 0);
 		if (bytesReceived <= 0)
 			throw std::runtime_error("Server Disconnected!!!\n");
 
-		fileName = buffer;
-		std::cout << "Trying to create file: " << fileName << std::endl;
+        int pos = buffer.find('-', 0);
+		fileName = buffer.substr(0, pos);
+        std::string fsize = buffer.substr(pos+1, bytesReceived);
+        unsigned long fileSize = std::stoul(fsize);
+		std::cout << "Trying to create file: " << fileName << " of size " 
+                    << fileSize << "bytes." << std::endl;
 		std::ofstream file(fileName, std::ios::binary);
 		if (!file)
 			throw std::runtime_error("File could not be created\n");
 
-		
-		do
-		{
-			bytesReceived = recv(client, buffer, bufferSize, 0);
-			std::cout << "Receiving File. bytes received is: " << bytesReceived << "bytes.\n";
-			if (bytesReceived > 0)
-				file.write(buffer, bytesReceived);
+        bool endOfFile = false;
+        unsigned long t_bytesReceived = 0;
+        int percent;
+        while(!endOfFile)
+        {
+            bytesReceived = recv(client, &buffer[0], bufferSize, 0);
+            t_bytesReceived += bytesReceived;
+            percent = (static_cast<float> (t_bytesReceived)/fileSize) * 100;
+			std::cout << "Receiving File... " << percent << "%.\n";
+            if(buffer.contains("file has endded"))
+                endOfFile = true;
+			if (bytesReceived > 0 && !endOfFile)
+				file.write(buffer.c_str(), bytesReceived);
+            std::string message = "ACK";
+            if (send(client, message.c_str(), message.length()+1, 0) == SOCKET_ERROR)
+				throw std::runtime_error("Error Sending Acknoledgment.\n");  
+        }
 
-		} while (bytesReceived == 1024);
-
-		std::cout << "File received successfult.\n";
+		std::cout << "File received successfuly.\n";
 		file.close();
 	}
 
@@ -200,7 +237,7 @@ public:
 };
 
 
-inline int prompt()
+int prompt()
 {
 	int input;
 	std::cout << "\n\t\tSimple peer-to-peer file transfer App.\n"
@@ -243,20 +280,11 @@ int main()
 					while (connection)
 					{
 						std::cout << "\nEnter File Name to send: ";
-						std::cin >> fileName;
+						//std::cin >> fileName;
+                        std::getline (std::cin, fileName);
 						try
 						{
 							server.sendFile(fileName);
-							try
-							{
-								const auto& message = server.receive();
-								std::cout << "Response from connected device: " << message << std::endl;
-							}
-							catch (std::runtime_error& e) 
-							{ 
-								std::cout << e.what();
-								connection = false;
-							}
 						}
 						catch (std::runtime_error& e) { std::cout << e.what(); }
 					}
@@ -286,12 +314,6 @@ int main()
 					{
 						std::cout << "Waiting to receive file.";
 						client.receiveFile();
-						try
-						{
-							client.sendOut("File received Successfully!");
-						}
-						catch (std::runtime_error& e) { std::cout << e.what(); }
-
 					}
 					catch (std::runtime_error& e) 
 					{ 
